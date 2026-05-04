@@ -1,0 +1,31 @@
+dataset_root: /u/97/habibip1/unix/point_cloud_registeration_benchmark/dataset
+results_root: /u/97/habibip1/unix/point_cloud_registeration_benchmark/results
+sequences:
+  mode: all
+  only:
+  skip: []
+
+methods:
+#  - scripts.methods.icp_open3d
+#  - scripts.methods.gicp_open3d
+#  - scripts.methods.fgr_open3d
+#  - scripts.methods.small_gicp    
+#  - scripts.methods.pcr_ndt
+#  - scripts.methods.pcr_point_to_plane_icp
+#  - scripts.methods.open3d_ransac_fpfh_icp
+#  - scripts.methods.g3reg_external
+- scripts.methods.kiss_matcher
+
+registration:
+  max_frames: 100
+  frame_step: 1
+  max_points_per_cloud: 100000
+  min_points_per_cloud: 100
+  print_every_n_frames: 1
+  invert_result_transform: false
+  allow_dummy_clouds: false
+
+evaluation:
+  use_evo: true
+  align: true
+  t_max_diff: 0.1
