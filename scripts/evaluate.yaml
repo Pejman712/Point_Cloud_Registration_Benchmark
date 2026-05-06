@@ -14,7 +14,9 @@ methods:
 #  - scripts.methods.pcr_point_to_plane_icp
 #  - scripts.methods.open3d_ransac_fpfh_icp
 #  - scripts.methods.g3reg_external
-- scripts.methods.kiss_matcher
+# - scripts.methods.kiss_matcher
+ - scripts.methods.semantic_small_gicp
+
 
 registration:
   max_frames: 100
@@ -28,4 +30,4 @@ registration:
 evaluation:
   use_evo: true
   align: true
-  t_max_diff: 0.1
+  t_max_diff: 0.1s
