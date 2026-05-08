@@ -18,14 +18,14 @@ S3DIS_CLASS_NAMES = [
     "wall",
     "beam",
     "column",
-    #"window",
-    #"door",
-    #"table",
-    #"chair",
-    #"sofa",
-    #"bookcase",
-    #"board",
-    #"clutter",
+    "window",
+    "door",
+    "table",
+    "chair",
+    "sofa",
+    "bookcase",
+    "board",
+    "clutter",
 ]
 
 S3DIS_COLORS = np.array(
@@ -47,6 +47,8 @@ S3DIS_COLORS = np.array(
     dtype=np.float32,
 )
 
+GENERALIZE_CLASSES = ["floor", "wall", "ceiling"]
+
 KNOWN_MD5 = {
     "randlanet_s3dis_202201071330utc.pth": None,
     "randlanet_s3dis_202010091238.pth": "5f993ef4a52065e4f882764568e6f378",
@@ -56,7 +58,7 @@ KNOWN_MD5 = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Segment a single PCD file using Open3D-ML RandLA-Net on CPU."
+        description="Segment a single PCD file using Open3D-ML RandLA-Net on CPU, then optionally generalize floor/wall/ceiling."
     )
 
     parser.add_argument("--input", required=True, help="Input .pcd file")
@@ -85,7 +87,7 @@ def parse_args():
         "--voxel_size",
         type=float,
         default=0.03,
-        help="Voxel downsampling size. Use 0 to disable.",
+        help="Voxel downsampling size before inference. Use 0 to disable.",
     )
 
     parser.add_argument(
@@ -112,21 +114,72 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--visualize",
+        "--generalize",
         action="store_true",
-        help="Visualize the final segmented point cloud in Open3D with class labels.",
+        help="Create an additional generalized PCD for floor, wall, and ceiling.",
     )
 
     parser.add_argument(
-        "--visualize_input",
-        action="store_true",
-        help="Visualize the input point cloud before inference.",
+        "--generalize_distance",
+        type=float,
+        default=0.08,
+        help="RANSAC plane inlier distance threshold for generalization.",
     )
 
     parser.add_argument(
-        "--visualize_each_topic",
+        "--generalize_voxel_size",
+        type=float,
+        default=0.10,
+        help="Voxel size used after projecting generalized planar points. Use 0 to disable.",
+    )
+
+    parser.add_argument(
+        "--generate_random_points",
         action="store_true",
-        help="Visualize each predicted S3DIS class/topic in a separate Open3D window.",
+        help="Generate additional random synthetic points on the detected floor/wall/ceiling planes.",
+    )
+
+    parser.add_argument(
+        "--random_points_per_class",
+        type=int,
+        default=5000,
+        help="Number of random synthetic points to add per generalized class.",
+    )
+
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=7,
+        help="Random seed used for synthetic point generation.",
+    )
+
+    parser.add_argument(
+        "--max_planes_per_class",
+        type=int,
+        default=10,
+        help="Maximum number of RANSAC planes to extract for each generalized class.",
+    )
+
+    parser.add_argument(
+        "--min_plane_points",
+        type=int,
+        default=300,
+        help="Minimum number of inlier points required to accept a detected plane.",
+    )
+
+    parser.add_argument(
+        "--keep_generalized_only",
+        action="store_true",
+        help=(
+            "When generalizing, save only floor/wall/ceiling generalized points. "
+            "Without this flag, the generalized output also keeps non-generalized classes."
+        ),
+    )
+
+    parser.add_argument(
+        "--show_before_after",
+        action="store_true",
+        help="Show simple before and after point clouds. No legend, no class text, no advanced UI.",
     )
 
     parser.add_argument(
@@ -322,7 +375,6 @@ def load_point_cloud(path):
 def make_features(pcd, points, feature_mode):
     """
     RandLA-Net S3DIS expects 3 feature channels in addition to XYZ.
-
     In S3DIS, these are RGB values. For LiDAR-only PCDs, this script
     synthesizes 3 feature channels.
     """
@@ -356,8 +408,24 @@ def make_features(pcd, points, feature_mode):
     return feat
 
 
-def save_label_npz(output_pcd_path, points, labels, scores):
+def print_class_counts(labels, title="Class counts"):
+    print(f"\n{title}:")
+    unique_labels, counts = np.unique(labels, return_counts=True)
+
+    for label, count in zip(unique_labels, counts):
+        if 0 <= label < len(S3DIS_CLASS_NAMES):
+            class_name = S3DIS_CLASS_NAMES[label]
+        else:
+            class_name = "unknown"
+
+        print(f"  {label:2d}  {class_name:10s}  {count}")
+
+
+def save_label_npz(output_pcd_path, points, labels, scores=None):
     npz_path = os.path.splitext(output_pcd_path)[0] + "_labels.npz"
+
+    if scores is None:
+        scores = np.ones((points.shape[0],), dtype=np.float32)
 
     np.savez_compressed(
         npz_path,
@@ -370,35 +438,7 @@ def save_label_npz(output_pcd_path, points, labels, scores):
     print(f"Saved label data:\n  {npz_path}")
 
 
-def print_class_legend(labels=None):
-    """
-    Print class names and colors in the terminal.
-    """
-
-    print("\nS3DIS class/topic legend:")
-
-    if labels is None:
-        used_labels = set(range(len(S3DIS_CLASS_NAMES)))
-    else:
-        used_labels = set(np.asarray(labels).astype(np.int32).tolist())
-
-    for idx, name in enumerate(S3DIS_CLASS_NAMES):
-        if idx not in used_labels:
-            continue
-
-        color = S3DIS_COLORS[idx]
-
-        print(
-            f"  {idx:2d}  {name:10s}  "
-            f"RGB=({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})"
-        )
-
-
 def create_colored_point_cloud(points, labels):
-    """
-    Create an Open3D point cloud colored by S3DIS predicted labels.
-    """
-
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
 
@@ -408,29 +448,28 @@ def create_colored_point_cloud(points, labels):
     return pcd
 
 
-def make_legend_marker(position, color, size):
+def save_segmented_pcd(output_path, points, labels):
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(output_dir, exist_ok=True)
+
+    pcd = create_colored_point_cloud(points, labels)
+
+    ok = o3d.io.write_point_cloud(
+        output_path,
+        pcd,
+        write_ascii=False,
+    )
+
+    if not ok:
+        raise RuntimeError(f"Failed to write point cloud: {output_path}")
+
+    print(f"Saved point cloud:\n  {output_path}")
+
+
+def show_point_cloud(pcd, window_name="Point Cloud", point_size=2.0, axis_size=1.0):
     """
-    Create a colored sphere used as a legend marker.
-    """
-
-    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=size)
-    sphere.translate(position)
-    sphere.paint_uniform_color(color.tolist())
-    sphere.compute_vertex_normals()
-
-    return sphere
-
-
-def visualize_legacy_point_cloud(
-    pcd,
-    window_name="Open3D Point Cloud",
-    point_size=2.0,
-    axis_size=1.0,
-):
-    """
-    Basic Open3D visualization without text labels.
-
-    Used for input visualization and as fallback if O3DVisualizer is unavailable.
+    Simple Open3D viewer.
+    No labels, no legend, no O3DVisualizer, no topic windows.
     """
 
     vis = o3d.visualization.Visualizer()
@@ -456,236 +495,485 @@ def visualize_legacy_point_cloud(
     vis.destroy_window()
 
 
-def visualize_point_cloud_with_legend(
-    pcd,
-    labels=None,
-    window_name="Open3D Point Cloud with Class Legend",
+def show_original_and_generated(
+    original_points,
+    generated_points,
     point_size=2.0,
     axis_size=1.0,
 ):
     """
-    Visualize point cloud with an in-window legend.
-
-    The legend is drawn beside the point cloud:
-      colored sphere + label number + class/object name.
-
-    This version uses the setup_camera signature supported by your Open3D build:
-      setup_camera(field_of_view, center, eye, up)
+    Show one simple Open3D window:
+      - original/downsampled input cloud in white
+      - generated synthetic points in green
     """
 
-    if labels is None:
-        used_labels = list(range(len(S3DIS_CLASS_NAMES)))
+    combined_pcd = o3d.geometry.PointCloud()
+
+    if generated_points is None or generated_points.shape[0] == 0:
+        all_points = original_points.astype(np.float64)
+        all_colors = np.ones((original_points.shape[0], 3), dtype=np.float64)
     else:
-        used_labels = sorted(set(np.asarray(labels).astype(np.int32).tolist()))
+        all_points = np.vstack([
+            original_points.astype(np.float32),
+            generated_points.astype(np.float32),
+        ]).astype(np.float64)
 
-    used_labels = [
-        label for label in used_labels
-        if 0 <= label < len(S3DIS_CLASS_NAMES)
-    ]
-
-    print_class_legend(np.asarray(used_labels, dtype=np.int32))
-
-    if not hasattr(o3d.visualization, "O3DVisualizer"):
-        print(
-            "\nWARNING: o3d.visualization.O3DVisualizer is not available in this Open3D version."
+        original_colors = np.ones((original_points.shape[0], 3), dtype=np.float64)
+        generated_colors = np.tile(
+            np.array([[0.0, 1.0, 0.0]], dtype=np.float64),
+            (generated_points.shape[0], 1),
         )
-        print("Falling back to basic visualization. Text labels will only appear in terminal.")
-        visualize_legacy_point_cloud(
-            pcd,
-            window_name=window_name,
-            point_size=point_size,
-            axis_size=axis_size,
-        )
-        return
+        all_colors = np.vstack([original_colors, generated_colors])
 
-    app = o3d.visualization.gui.Application.instance
-    app.initialize()
+    combined_pcd.points = o3d.utility.Vector3dVector(all_points)
+    combined_pcd.colors = o3d.utility.Vector3dVector(all_colors)
 
-    vis = o3d.visualization.O3DVisualizer(window_name, 1280, 720)
-    vis.show_settings = True
-
-    pcd_mat = o3d.visualization.rendering.MaterialRecord()
-    pcd_mat.shader = "defaultUnlit"
-    pcd_mat.point_size = point_size
-
-    vis.add_geometry("segmented_point_cloud", pcd, pcd_mat)
-
-    if axis_size > 0:
-        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=axis_size)
-        vis.add_geometry("axis", axis)
-
-    bbox = pcd.get_axis_aligned_bounding_box()
-    min_bound = bbox.min_bound
-    max_bound = bbox.max_bound
-    extent = bbox.get_extent()
-
-    max_extent = max(float(np.max(extent)), 1.0)
-    diagonal = max(float(np.linalg.norm(extent)), 1.0)
-
-    # Place legend to the right side of the cloud.
-    legend_x = max_bound[0] + 0.12 * max_extent
-    legend_y = min_bound[1]
-    legend_z = max_bound[2]
-
-    spacing = 0.07 * diagonal
-    marker_size = 0.012 * diagonal
-
-    if spacing <= 0:
-        spacing = 0.1
-
-    if marker_size <= 0:
-        marker_size = 0.05
-
-    for row, label in enumerate(used_labels):
-        class_name = S3DIS_CLASS_NAMES[label]
-        color = S3DIS_COLORS[label]
-
-        marker_position = np.array(
-            [
-                legend_x,
-                legend_y,
-                legend_z - row * spacing,
-            ],
-            dtype=np.float64,
-        )
-
-        marker = make_legend_marker(
-            position=marker_position,
-            color=color,
-            size=marker_size,
-        )
-
-        marker_mat = o3d.visualization.rendering.MaterialRecord()
-        marker_mat.shader = "defaultLit"
-
-        vis.add_geometry(
-            f"legend_marker_{label}_{class_name}",
-            marker,
-            marker_mat,
-        )
-
-        text_position = marker_position + np.array(
-            [marker_size * 3.0, 0.0, 0.0],
-            dtype=np.float64,
-        )
-
-        vis.add_3d_label(
-            text_position,
-            f"{label}: {class_name}",
-        )
-
-    # Include both cloud and legend in the camera target.
-    legend_min = np.array(
-        [
-            legend_x,
-            legend_y,
-            legend_z - max(len(used_labels) - 1, 0) * spacing,
-        ],
-        dtype=np.float64,
-    )
-
-    legend_max = np.array(
-        [
-            legend_x + 0.5 * max_extent,
-            legend_y,
-            legend_z,
-        ],
-        dtype=np.float64,
-    )
-
-    full_min = np.minimum(min_bound, legend_min)
-    full_max = np.maximum(max_bound, legend_max)
-
-    full_bbox = o3d.geometry.AxisAlignedBoundingBox(
-        min_bound=full_min,
-        max_bound=full_max,
-    )
-
-    center = full_bbox.get_center().astype(np.float32)
-    extent_full = full_bbox.get_extent()
-    radius = max(float(np.linalg.norm(extent_full)), 1.0)
-
-    eye = (
-        center
-        + np.array(
-            [
-                0.0,
-                -1.8 * radius,
-                0.8 * radius,
-            ],
-            dtype=np.float32,
-        )
-    )
-
-    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
-    vis.setup_camera(
-        60.0,
-        center,
-        eye,
-        up,
-    )
-
-    app.add_window(vis)
-    app.run()
-
-
-def visualize_segmented_point_cloud(points, labels, point_size=2.0, axis_size=1.0):
-    """
-    Visualize the complete segmented point cloud with class legend.
-    """
-
-    segmented_pcd = create_colored_point_cloud(points, labels)
-
-    visualize_point_cloud_with_legend(
-        segmented_pcd,
-        labels=labels,
-        window_name="RandLA-Net S3DIS Segmentation with Class Legend",
+    print("Showing original cloud in white and generated points in green.")
+    show_point_cloud(
+        combined_pcd,
+        window_name="Original Cloud White + Generated Points Green",
         point_size=point_size,
         axis_size=axis_size,
     )
 
 
-def visualize_each_topic_separately(points, labels, point_size=2.0, axis_size=1.0):
+# -------------------------------------------------------------------------
+# Point generalization
+# -------------------------------------------------------------------------
+
+
+def extract_class_points(points, labels, class_name):
+    if class_name not in S3DIS_CLASS_NAMES:
+        raise ValueError(f"Unknown S3DIS class name: {class_name}")
+
+    class_id = S3DIS_CLASS_NAMES.index(class_name)
+    mask = labels == class_id
+
+    return points[mask], mask, class_id
+
+
+def fit_plane_ransac(
+    points,
+    distance_threshold=0.08,
+    ransac_n=3,
+    num_iterations=2000,
+):
+    if points.shape[0] < ransac_n:
+        return None, []
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+
+    plane_model, inliers = pcd.segment_plane(
+        distance_threshold=distance_threshold,
+        ransac_n=ransac_n,
+        num_iterations=num_iterations,
+    )
+
+    return plane_model, inliers
+
+
+def project_points_to_plane(points, plane_model):
+    a, b, c, d = plane_model
+
+    normal = np.array([a, b, c], dtype=np.float32)
+    normal_norm = np.linalg.norm(normal)
+
+    if normal_norm < 1e-8:
+        raise RuntimeError("Invalid plane normal.")
+
+    normal = normal / normal_norm
+
+    distances = points @ normal + d
+    projected = points - distances[:, None] * normal[None, :]
+
+    return projected.astype(np.float32)
+
+
+def downsample_points_with_labels(points, labels, voxel_size):
+    if points.shape[0] == 0:
+        return points, labels
+
+    if voxel_size <= 0:
+        return points, labels
+
+    pcd = create_colored_point_cloud(points, labels)
+    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+
+    down_points = np.asarray(pcd.points).astype(np.float32)
+
+    if labels.shape[0] > 0:
+        class_id = int(labels[0])
+    else:
+        class_id = 0
+
+    down_labels = np.full(
+        down_points.shape[0],
+        class_id,
+        dtype=np.int32,
+    )
+
+    return down_points, down_labels
+
+
+def make_plane_basis(plane_model):
     """
-    Visualize one predicted class/topic at a time.
-
-    Each window shows the class name as a 3D label.
-    Close the Open3D window to move to the next class.
+    Create two orthonormal basis vectors that lie inside a plane.
     """
 
-    unique_labels = np.unique(labels)
+    a, b, c, _ = plane_model
+    normal = np.array([a, b, c], dtype=np.float32)
+    normal = normal / (np.linalg.norm(normal) + 1e-8)
 
-    for label in unique_labels:
-        if 0 <= label < len(S3DIS_CLASS_NAMES):
-            class_name = S3DIS_CLASS_NAMES[label]
-        else:
-            class_name = "unknown"
+    if abs(float(normal[2])) < 0.9:
+        reference = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    else:
+        reference = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
-        mask = labels == label
-        class_points = points[mask]
+    basis_u = np.cross(normal, reference)
+    basis_u = basis_u / (np.linalg.norm(basis_u) + 1e-8)
 
-        if class_points.shape[0] == 0:
+    basis_v = np.cross(normal, basis_u)
+    basis_v = basis_v / (np.linalg.norm(basis_v) + 1e-8)
+
+    return basis_u.astype(np.float32), basis_v.astype(np.float32), normal.astype(np.float32)
+
+
+def convex_hull_2d(points_2d):
+    """
+    Compute a 2D convex hull using Andrew's monotonic chain algorithm.
+    Returns hull vertices in counter-clockwise order.
+    """
+
+    pts = np.unique(points_2d.astype(np.float64), axis=0)
+
+    if pts.shape[0] <= 2:
+        return pts
+
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(tuple(p))
+
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(tuple(p))
+
+    hull = np.array(lower[:-1] + upper[:-1], dtype=np.float64)
+    return hull
+
+
+def points_inside_convex_polygon(points_2d, polygon):
+    """
+    Check whether 2D points are inside a convex polygon.
+    Boundary points are accepted.
+    """
+
+    if polygon.shape[0] < 3:
+        return np.zeros(points_2d.shape[0], dtype=bool)
+
+    inside = np.ones(points_2d.shape[0], dtype=bool)
+    eps = 1e-9
+
+    for i in range(polygon.shape[0]):
+        a = polygon[i]
+        b = polygon[(i + 1) % polygon.shape[0]]
+        edge = b - a
+        rel = points_2d - a[None, :]
+        cross = edge[0] * rel[:, 1] - edge[1] * rel[:, 0]
+        inside &= cross >= -eps
+
+    return inside
+
+
+def generate_random_points_on_plane_region(
+    plane_points,
+    plane_model,
+    num_points,
+    random_seed=7,
+):
+    """
+    Generate random synthetic points on the same bounded plane region as the detected points.
+
+    This version samples inside the 2D convex hull of the detected planar points,
+    not the full rectangular bounding box. This prevents generated points from
+    spreading far outside the observed cloud boundary.
+    """
+
+    if num_points <= 0 or plane_points.shape[0] < 3:
+        return np.empty((0, 3), dtype=np.float32)
+
+    basis_u, basis_v, normal = make_plane_basis(plane_model)
+
+    origin = plane_points.mean(axis=0).astype(np.float32)
+    relative = plane_points.astype(np.float32) - origin[None, :]
+
+    coords_u = relative @ basis_u
+    coords_v = relative @ basis_v
+    coords_2d = np.column_stack([coords_u, coords_v]).astype(np.float64)
+
+    hull = convex_hull_2d(coords_2d)
+
+    if hull.shape[0] < 3:
+        return np.empty((0, 3), dtype=np.float32)
+
+    u_min, v_min = hull.min(axis=0)
+    u_max, v_max = hull.max(axis=0)
+
+    rng = np.random.default_rng(random_seed)
+    accepted = []
+    remaining = int(num_points)
+    max_rounds = 100
+
+    for _ in range(max_rounds):
+        if remaining <= 0:
+            break
+
+        # Oversample because rejection removes candidates outside the hull.
+        batch_size = max(remaining * 3, 1000)
+        sample_u = rng.uniform(u_min, u_max, size=batch_size)
+        sample_v = rng.uniform(v_min, v_max, size=batch_size)
+        candidates = np.column_stack([sample_u, sample_v])
+
+        mask = points_inside_convex_polygon(candidates, hull)
+        inside_candidates = candidates[mask]
+
+        if inside_candidates.shape[0] == 0:
             continue
 
-        class_pcd = o3d.geometry.PointCloud()
-        class_pcd.points = o3d.utility.Vector3dVector(class_points.astype(np.float64))
+        take = min(remaining, inside_candidates.shape[0])
+        accepted.append(inside_candidates[:take])
+        remaining -= take
 
-        color = S3DIS_COLORS[label % len(S3DIS_COLORS)]
-        class_colors = np.tile(color, (class_points.shape[0], 1))
-        class_pcd.colors = o3d.utility.Vector3dVector(class_colors.astype(np.float64))
+    if not accepted:
+        return np.empty((0, 3), dtype=np.float32)
 
-        print(f"\nVisualizing topic/class: {label} - {class_name}")
-        print(f"Points: {class_points.shape[0]}")
-        print(f"Color: RGB=({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})")
+    sampled_2d = np.vstack(accepted).astype(np.float32)
 
-        visualize_point_cloud_with_legend(
-            class_pcd,
-            labels=np.asarray([label], dtype=np.int32),
-            window_name=f"S3DIS topic/class: {label} - {class_name}",
-            point_size=point_size,
-            axis_size=axis_size,
+    sampled_points = (
+        origin[None, :]
+        + sampled_2d[:, 0:1] * basis_u[None, :]
+        + sampled_2d[:, 1:2] * basis_v[None, :]
+    )
+
+    sampled_points = project_points_to_plane(sampled_points, plane_model)
+
+    return sampled_points.astype(np.float32)
+
+
+def generalize_planar_class(
+    points,
+    labels,
+    class_name,
+    distance_threshold=0.08,
+    voxel_size=0.10,
+    generate_random_points=False,
+    random_points_per_class=5000,
+    random_seed=7,
+    max_planes_per_class=10,
+    min_plane_points=300,
+):
+    """
+    Extract multiple planar patches for one semantic class.
+
+    Instead of fitting only one dominant plane, this repeatedly:
+      1. fits a RANSAC plane,
+      2. removes its inliers,
+      3. fits another plane to the remaining points.
+
+    This allows around max_planes_per_class planes per class.
+    """
+
+    class_points, class_mask, class_id = extract_class_points(points, labels, class_name)
+
+    if class_points.shape[0] == 0:
+        print(f"No points found for class: {class_name}")
+        return None, None, [], class_mask, None
+
+    remaining_points = class_points.astype(np.float32).copy()
+
+    generalized_points_list = []
+    generalized_labels_list = []
+    random_points_list = []
+    plane_models = []
+
+    print(f"Generalizing {class_name} with up to {max_planes_per_class} planes...")
+    print(f"  Original class points: {class_points.shape[0]}")
+
+    for plane_idx in range(max_planes_per_class):
+        if remaining_points.shape[0] < max(min_plane_points, 3):
+            print(
+                f"  Stop: only {remaining_points.shape[0]} remaining points, "
+                f"minimum is {min_plane_points}."
+            )
+            break
+
+        plane_model, inliers = fit_plane_ransac(
+            remaining_points,
+            distance_threshold=distance_threshold,
+            ransac_n=3,
+            num_iterations=2000,
         )
+
+        if plane_model is None or len(inliers) < min_plane_points:
+            print(
+                f"  Stop: plane {plane_idx + 1} has {len(inliers) if inliers is not None else 0} "
+                f"inliers, minimum is {min_plane_points}."
+            )
+            break
+
+        inliers = np.asarray(inliers, dtype=np.int32)
+        inlier_points = remaining_points[inliers]
+
+        projected_original_points = project_points_to_plane(inlier_points, plane_model)
+        random_points = np.empty((0, 3), dtype=np.float32)
+
+        if generate_random_points:
+            # Distribute the requested random points across the detected planes.
+            points_for_this_plane = max(1, int(random_points_per_class // max_planes_per_class))
+
+            random_points = generate_random_points_on_plane_region(
+                projected_original_points,
+                plane_model,
+                num_points=points_for_this_plane,
+                random_seed=random_seed + class_id * 1000 + plane_idx,
+            )
+
+        if random_points.shape[0] > 0:
+            projected_points = np.vstack([projected_original_points, random_points]).astype(np.float32)
+            random_points_list.append(random_points.astype(np.float32))
+        else:
+            projected_points = projected_original_points.astype(np.float32)
+
+        projected_labels = np.full(
+            projected_points.shape[0],
+            class_id,
+            dtype=np.int32,
+        )
+
+        generalized_points, generalized_labels = downsample_points_with_labels(
+            projected_points,
+            projected_labels,
+            voxel_size=voxel_size,
+        )
+
+        generalized_points_list.append(generalized_points)
+        generalized_labels_list.append(generalized_labels)
+        plane_models.append(plane_model)
+
+        print(f"  Plane {plane_idx + 1:02d}:")
+        print(f"    Inlier points:       {len(inliers)}")
+        print(f"    Random generated:    {random_points.shape[0]}")
+        print(f"    Output points:       {generalized_points.shape[0]}")
+        print(
+            "    Plane model:         "
+            f"a={plane_model[0]:.6f}, "
+            f"b={plane_model[1]:.6f}, "
+            f"c={plane_model[2]:.6f}, "
+            f"d={plane_model[3]:.6f}"
+        )
+
+        keep_remaining_mask = np.ones(remaining_points.shape[0], dtype=bool)
+        keep_remaining_mask[inliers] = False
+        remaining_points = remaining_points[keep_remaining_mask]
+
+    if not generalized_points_list:
+        print(f"  No accepted planes for class: {class_name}")
+        return None, None, [], class_mask, None
+
+    all_generalized_points = np.vstack(generalized_points_list).astype(np.float32)
+    all_generalized_labels = np.concatenate(generalized_labels_list).astype(np.int32)
+
+    if random_points_list:
+        all_random_points = np.vstack(random_points_list).astype(np.float32)
+    else:
+        all_random_points = np.empty((0, 3), dtype=np.float32)
+
+    print(f"  Accepted planes:       {len(plane_models)}")
+    print(f"  Total output points:   {all_generalized_points.shape[0]}")
+    print(f"  Total random points:   {all_random_points.shape[0]}")
+
+    return all_generalized_points, all_generalized_labels, plane_models, class_mask, all_random_points
+
+
+def generalize_floor_wall_ceiling(
+    points,
+    labels,
+    distance_threshold=0.08,
+    voxel_size=0.10,
+    keep_generalized_only=False,
+    generate_random_points=False,
+    random_points_per_class=5000,
+    random_seed=7,
+    max_planes_per_class=10,
+    min_plane_points=300,
+):
+    generalized_points_list = []
+    generalized_labels_list = []
+    random_points_list = []
+
+    generalized_class_ids = set()
+
+    for class_name in GENERALIZE_CLASSES:
+        class_id = S3DIS_CLASS_NAMES.index(class_name)
+        generalized_class_ids.add(class_id)
+
+        generalized_points, generalized_labels, plane_models, class_mask, random_points = generalize_planar_class(
+            points,
+            labels,
+            class_name,
+            distance_threshold=distance_threshold,
+            voxel_size=voxel_size,
+            generate_random_points=generate_random_points,
+            random_points_per_class=random_points_per_class,
+            random_seed=random_seed,
+            max_planes_per_class=max_planes_per_class,
+            min_plane_points=min_plane_points,
+        )
+
+        if generalized_points is not None:
+            generalized_points_list.append(generalized_points)
+            generalized_labels_list.append(generalized_labels)
+
+        if random_points is not None and random_points.shape[0] > 0:
+            random_points_list.append(random_points.astype(np.float32))
+
+    if not keep_generalized_only:
+        keep_mask = np.ones(labels.shape[0], dtype=bool)
+
+        for class_id in generalized_class_ids:
+            keep_mask &= labels != class_id
+
+        remaining_points = points[keep_mask]
+        remaining_labels = labels[keep_mask]
+
+        if remaining_points.shape[0] > 0:
+            generalized_points_list.append(remaining_points.astype(np.float32))
+            generalized_labels_list.append(remaining_labels.astype(np.int32))
+
+    if not generalized_points_list:
+        raise RuntimeError("No generalized points were produced.")
+
+    generalized_points = np.vstack(generalized_points_list).astype(np.float32)
+    generalized_labels = np.concatenate(generalized_labels_list).astype(np.int32)
+
+    if random_points_list:
+        all_random_points = np.vstack(random_points_list).astype(np.float32)
+    else:
+        all_random_points = np.empty((0, 3), dtype=np.float32)
+
+    print_class_counts(generalized_labels, title="Generalized output class counts")
+    print(f"Total generated random points: {all_random_points.shape[0]}")
+
+    return generalized_points, generalized_labels, all_random_points
 
 
 def main():
@@ -741,15 +1029,6 @@ def main():
     print("Reading point cloud...")
     pcd = load_point_cloud(args.input)
 
-    if args.visualize_input:
-        print("Visualizing input point cloud...")
-        visualize_legacy_point_cloud(
-            pcd,
-            window_name="Input Point Cloud",
-            point_size=args.point_size,
-            axis_size=args.axis_size,
-        )
-
     if args.voxel_size > 0:
         print(f"Voxel downsampling with voxel_size={args.voxel_size}")
         pcd = pcd.voxel_down_sample(voxel_size=args.voxel_size)
@@ -775,49 +1054,48 @@ def main():
     pred_labels = result["predict_labels"].astype(np.int32)
     pred_scores = result["predict_scores"].astype(np.float32)
 
-    print("\nPredicted class counts:")
-    unique_labels, counts = np.unique(pred_labels, return_counts=True)
+    print_class_counts(pred_labels, title="Predicted class counts")
 
-    for label, count in zip(unique_labels, counts):
-        if 0 <= label < len(S3DIS_CLASS_NAMES):
-            class_name = S3DIS_CLASS_NAMES[label]
-        else:
-            class_name = "unknown"
-
-        print(f"  {label:2d}  {class_name:10s}  {count}")
-
-    print_class_legend(pred_labels)
-
-    colors = S3DIS_COLORS[pred_labels % len(S3DIS_COLORS)]
-    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-
-    output_dir = os.path.dirname(os.path.abspath(args.output))
-    os.makedirs(output_dir, exist_ok=True)
-
-    ok = o3d.io.write_point_cloud(args.output, pcd, write_ascii=False)
-
-    if not ok:
-        raise RuntimeError(f"Failed to write output point cloud: {args.output}")
-
-    print(f"\nSaved segmented point cloud:\n  {args.output}")
-
+    save_segmented_pcd(args.output, points, pred_labels)
     save_label_npz(args.output, points, pred_labels, pred_scores)
 
-    if args.visualize:
-        visualize_segmented_point_cloud(
+    generalized_points = None
+    generalized_labels = None
+    generated_random_points = np.empty((0, 3), dtype=np.float32)
+
+    if args.generalize:
+        print("\nRunning point generalization for floor, wall, and ceiling...")
+
+        generalized_points, generalized_labels, generated_random_points = generalize_floor_wall_ceiling(
             points,
             pred_labels,
-            point_size=args.point_size,
-            axis_size=args.axis_size,
+            distance_threshold=args.generalize_distance,
+            voxel_size=args.generalize_voxel_size,
+            keep_generalized_only=args.keep_generalized_only,
+            generate_random_points=args.generate_random_points,
+            random_points_per_class=args.random_points_per_class,
+            random_seed=args.random_seed,
+            max_planes_per_class=args.max_planes_per_class,
+            min_plane_points=args.min_plane_points,
         )
 
-    if args.visualize_each_topic:
-        visualize_each_topic_separately(
-            points,
-            pred_labels,
-            point_size=args.point_size,
-            axis_size=args.axis_size,
-        )
+        generalized_output = os.path.splitext(args.output)[0] + "_generalized.pcd"
+
+        save_segmented_pcd(generalized_output, generalized_points, generalized_labels)
+        save_label_npz(generalized_output, generalized_points, generalized_labels)
+
+    if args.show_before_after:
+        if not args.generate_random_points or generated_random_points.shape[0] == 0:
+            print("WARNING: No generated random points are available to show. "
+                "Use --generalize --generate_random_points."
+            )
+        else:
+            show_original_and_generated(
+                original_points=points,
+                generated_points=generated_random_points,
+                point_size=args.point_size,
+                axis_size=args.axis_size,
+            )
 
 
 if __name__ == "__main__":
